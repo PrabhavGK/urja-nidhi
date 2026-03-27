@@ -13,8 +13,11 @@ New in this version:
 """
 
 # ── Load .env FIRST ───────────────────────────────────────────────────────────
+from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
+# Ensure we load the project's v5/.env (not whatever the current working directory is).
+_BASE_DIR = Path(__file__).resolve().parents[1]  # .../v5/
+load_dotenv(dotenv_path=str(_BASE_DIR / ".env"))
 
 from flask import Flask, request, jsonify, render_template, session
 from flask_cors import CORS
@@ -24,6 +27,15 @@ import os, json, threading, time, sqlite3, random, smtplib, secrets, hashlib
 from datetime import datetime, timedelta
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+import sys
+
+# Windows PowerShell default encoding can break emoji prints (e.g. "✅").
+# Force UTF-8 output to avoid UnicodeEncodeError during startup.
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
 
 # ── App ───────────────────────────────────────────────────────────────────────
 CWD = os.path.dirname(os.path.abspath(__file__))
@@ -71,6 +83,33 @@ TWILIO_CFG = {
 # ── Gemini ────────────────────────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
+# MQ5 (ADS1115) helper: convert raw 0-32767 to approximate ppm for a 0-3.3V setup.
+def mq5_raw_to_ppm(methane_raw):
+    try:
+        if methane_raw is None:
+            return None
+        r = float(methane_raw)
+        if r < 0:
+            return None
+        # MQ5 raw-to-ppm mapping is approximately banded per your reference table:
+        # raw 0-3000   -> <200 ppm
+        # raw 3000-8000 -> 200-1000 ppm
+        # raw 8000-16000 -> 1000-3000 ppm
+        # raw 16000-24000 -> 3000-6000 ppm
+        # This is a piecewise-linear approximation to keep ppm-only UI consistent.
+        if r <= 3000.0:
+            return ((r / 3000.0) * 200.0)*14.5
+        if r <= 8000.0:
+            return (200.0 + (r - 3000.0) * (800.0 / 5000.0))*14.5  # 200 -> 1000
+        if r <= 16000.0:
+            return (1000.0 + (r - 8000.0) * (2000.0 / 8000.0))*14.5  # 1000 -> 3000
+        if r <= 24000.0:
+            return (3000.0 + (r - 16000.0) * (3000.0 / 8000.0))*14.5  # 3000 -> 6000
+        # Extend beyond with the last slope.
+        return (6000.0 + (r - 24000.0) * (3000.0 / 8000.0))*14.5
+    except Exception:
+        return None
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ── FIREBASE CONFIG (Layer 4a — Realtime Database) ───────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
@@ -87,21 +126,19 @@ FIREBASE_CONFIG = {
 
     # ── Database path where your ESP32 writes sensor data ────────────────────
     # Example: if ESP32 writes to /digesters/DIG001/sensors, set "digesters/DIG001/sensors"
-    "sensor_path": os.getenv("FIREBASE_SENSOR_PATH", "digesters/DIG001/sensors"),
+    "sensor_path": os.getenv("FIREBASE_SENSOR_PATH", "sensorData"),
 
     # ── Service Account credentials (for server-side read) ───────────────────
     # Firebase Console → Project Settings → Service Accounts → Generate new private key
     # Download the JSON file, place it in backend/ as firebase_credentials.json
     # OR set FIREBASE_CREDENTIALS_PATH in .env to point to a different location
-    "credentials_path": os.getenv(
-        "FIREBASE_CREDENTIALS_PATH",
-        os.path.join(CWD, "firebase_credentials.json")
-    ),
+    "credentials_path": os.path.join(CWD, os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase_credentials.json")),
 }
 
 # Firebase listener state
 _firebase_app    = None
 _firebase_active = False
+_last_valid_npk  = {"n": None, "p": None, "k": None}
 
 def init_firebase():
     """
@@ -151,24 +188,58 @@ def firebase_sensor_listener():
             try:
                 data = event.data
                 if not isinstance(data, dict): return
-                # Normalise field names (ESP32 may send camelCase or snake_case)
+                # Normalise field names — handle multiple naming conventions
+                # Firebase may send: temperature_C, temperature, temp, etc.
+
+                def _maybe_npk(v):
+                    """Treat negative / -1 values as missing."""
+                    try:
+                        fv = float(v)
+                        return fv if fv >= 0 else None
+                    except Exception:
+                        return None
+
+                n_in = data.get("nitrogen_concentration", data.get("nitrogen_mgkg", None))
+                p_in = data.get("phosphorus_concentration", data.get("phosphorus_mgkg", None))
+                k_in = data.get("potassium_concentration", data.get("potassium_mgkg", None))
+                n_val = _maybe_npk(n_in)
+                p_val = _maybe_npk(p_in)
+                k_val = _maybe_npk(k_in)
+
+                # Reuse last valid values so the dashboard never shows -1.
+                if n_val is not None:
+                    _last_valid_npk["n"] = n_val
+                if p_val is not None:
+                    _last_valid_npk["p"] = p_val
+                if k_val is not None:
+                    _last_valid_npk["k"] = k_val
+
                 reading = {
                     "digester_id": data.get("digester_id", "DIG001"),
-                    "temperature": float(data.get("temperature", data.get("temp", 0))),
+                    "temperature": float(data.get("temperature", data.get("temperature_C", data.get("temp", 0)))),
                     "ph":          float(data.get("ph", data.get("pH", 7.0))),
-                    "pressure":    float(data.get("pressure", 105.0)),
-                    "gas_flow":    float(data.get("gas_flow", data.get("gasFlow", 0))),
+                    "pressure":    float(data.get("pressure", data.get("pressure_kPa", 105.0))),
+                    "gas_flow":    float(data.get("gas_flow", data.get("gasFlow", data.get("gas_flow_lh", 0)))),
+                    "methane_raw": float(data.get("methane_raw", data.get("methane_ppm", 0))),
+                    "nitrogen_concentration": _last_valid_npk["n"],
+                    "phosphorus_concentration": _last_valid_npk["p"],
+                    "potassium_concentration": _last_valid_npk["k"],
                     "timestamp":   data.get("timestamp", datetime.now().isoformat()),
                 }
+                reading["methane_ppm"] = mq5_raw_to_ppm(reading["methane_raw"])
                 alerts = check_alerts(reading)
                 # Persist to SQLite
                 try:
                     conn = get_db()
                     conn.execute("""INSERT INTO sensor_readings
-                        (digester_id,temperature,ph,pressure,gas_flow,timestamp)
-                        VALUES (?,?,?,?,?,?)""",
+                        (digester_id,temperature,ph,pressure,gas_flow,methane_raw,methane_ppm,
+                         nitrogen_concentration,phosphorus_concentration,potassium_concentration,timestamp)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                         (reading["digester_id"], reading["temperature"], reading["ph"],
-                         reading["pressure"], reading["gas_flow"], reading["timestamp"]))
+                         reading["pressure"], reading["gas_flow"], reading["methane_raw"], 
+                         reading["methane_ppm"],
+                         reading["nitrogen_concentration"], reading["phosphorus_concentration"],
+                         reading["potassium_concentration"], reading["timestamp"]))
                     conn.commit(); conn.close()
                 except Exception: pass
                 # Push to dashboard via WebSocket
@@ -206,6 +277,8 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             digester_id TEXT DEFAULT 'DIG001',
             temperature REAL, ph REAL, pressure REAL, gas_flow REAL,
+            methane_raw REAL, methane_ppm REAL,
+            nitrogen_concentration REAL, phosphorus_concentration REAL, potassium_concentration REAL,
             timestamp TEXT
         );
 
@@ -268,41 +341,304 @@ def init_db():
 
         -- Custom threshold limits per parameter (one row per param, system-wide)
         CREATE TABLE IF NOT EXISTS thresholds (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            param     TEXT UNIQUE NOT NULL,
-            label     TEXT NOT NULL,
-            unit      TEXT NOT NULL,
-            low_warn  REAL,
-            low_crit  REAL,
-            high_warn REAL,
-            high_crit REAL,
-            enabled   INTEGER DEFAULT 1,
-            updated_at TEXT
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            param        TEXT UNIQUE NOT NULL,
+            label        TEXT NOT NULL,
+            unit         TEXT NOT NULL,
+            low_warn     REAL,
+            low_crit     REAL,
+            high_warn    REAL,
+            high_crit    REAL,
+            sensor_type  TEXT,
+            interpretation TEXT,
+            enabled      INTEGER DEFAULT 1,
+            updated_at   TEXT
         );
     """)
+    # Schema migration for older SQLite DBs (ADD missing columns only).
+    sensor_cols = {r["name"] for r in conn.execute("PRAGMA table_info(sensor_readings)").fetchall()}
+    def _add_col(col: str, col_type: str):
+        if col not in sensor_cols:
+            conn.execute(f"ALTER TABLE sensor_readings ADD COLUMN {col} {col_type}")
+
+    _add_col("methane_raw", "REAL")
+    _add_col("methane_ppm", "REAL")
+    _add_col("nitrogen_concentration", "REAL")
+    _add_col("phosphorus_concentration", "REAL")
+    _add_col("potassium_concentration", "REAL")
+
     conn.commit(); conn.close()
 
 init_db()
 
 # ── Seed default thresholds (only if table is empty) ─────────────────────────
 def seed_thresholds():
+    """
+    Seed thresholds with sensor-specific interpretations.
+    Based on: DS18B20, MQ5 (via ADS1115), DFRobot pH, Pressure sensor, ADS1115 ref.
+    """
     conn = get_db()
     existing = conn.execute("SELECT COUNT(*) FROM thresholds").fetchone()[0]
+
+    # (param, label, unit, low_warn, low_crit, high_warn, high_crit, sensor_type, interpretation)
+    defaults = [
+            # ── DS18B20 Temperature (°C) ──────────────────────────────────────
+            ("temperature", "Digester Temperature", "°C",
+             20.0, 10.0, 30.0, 40.0,
+             "DS18B20",
+             "Optimal: 20-30°C (soil/water) or 30-40°C (biogas mesophilic)"),
+            
+            # ── DFRobot pH Sensor (via ADS1115) ─────────────────────────────
+            ("ph", "Digester pH Level", "",
+             6.0, 4.0, 8.5, 10.0,
+             "DFRobot_pH",
+             "Optimal: 6.8-7.5 (biogas). Soil: 6.0-7.0. Water: 6.5-8.5"),
+            
+            # ── Pressure (0-1.2 MPa → KPa) ──────────────────────────────────
+            ("pressure", "Digester Pressure", "kPa",
+             80.0, 50.0, 130.0, 150.0,
+             "Pressure",
+             "Normal range: 80-130 kPa. Monitor for leaks/blockages."),
+            
+            # ── MQ5 Methane (raw ADS1115 value: 0-32767) ──────────────────
+            ("methane_raw", "Methane Sensor (Raw)", "ADC",
+             8000.0, 3000.0, 16000.0, 24000.0,
+             "MQ5",
+             "0-200 ppm: clean | 200-1000 ppm: low | 1000-3000 ppm: moderate | 3000-6000 ppm: high | >6000 ppm: dangerous"),
+            
+            # ── Gas Flow Rate (L/h) ──────────────────────────────────────────
+            ("gas_flow", "Gas Flow Rate", "L/h",
+             1.0, 0.5, None, None,
+             "Generic",
+             "Minimum viable: 1 L/h. Below 0.5: check feed & mixing."),
+            
+            # ── Ambient Temperature (°C) ────────────────────────────────────
+            ("ambient_temperature", "Ambient Temperature", "°C",
+             15.0, 10.0, 40.0, 45.0,
+             "DS18B20",
+             "Affects digester efficiency. Keep digester insulated."),
+            
+            # ── Ambient Humidity (%) ────────────────────────────────────────
+            ("ambient_humidity", "Ambient Humidity", "%",
+             30.0, None, 85.0, 95.0,
+             "Generic",
+             "High humidity: check for condensation. Low: monitor evaporation."),
+            
+            # ── Nitrogen (ppm / % estimate) ─────────────────────────────────
+            ("nitrogen_concentration", "Nitrogen Level", "mg/kg",
+             1500.0, 1000.0, 3000.0, 3500.0,
+             "Nutrient",
+             "Low (<1500): underfed. High (>3000): overfeeding. Optimal: 1500-3000"),
+            
+            # ── Phosphorus (ppm / % estimate) ───────────────────────────────
+            ("phosphorus_concentration", "Phosphorus Level", "mg/kg",
+             420.0, 300.0, 800.0, 950.0,
+             "Nutrient",
+             "Low (<420): add phosphate rock. High: balanced mix needed."),
+            
+            # ── Potassium (ppm / % estimate from user reference) ────────────
+            ("potassium_concentration", "Potassium Level", "mg/kg",
+             50.0, None, 100.0, 150.0,
+             "Nutrient",
+             "Optimal: 50-100 mg/kg (medium). >100 = high. <50 = low."),
+            
+            # ── Methane % (for analyzer modules) ────────────────────────────
+            ("methane_concentration", "Methane Gas %", "%",
+             40.0, 30.0, 75.0, 85.0,
+             "MQ5",
+             "Typical biogas: 50-70% CH4. <40%: check pretreatment."),
+    ]
+
     if existing == 0:
-        defaults = [
-            ("temperature",          "Temperature",   "°C",  30.0, None, 40.0,  42.0),
-            ("ph",                   "pH Level",      "",     6.8,  6.5,  7.5,   7.8),
-            ("pressure",             "Pressure",      "kPa", 80.0, None, 130.0, 150.0),
-            ("gas_flow",             "Gas Flow",      "L/h",  1.0,  0.5,  None,  None),
-            ("methane_concentration","Methane",       "%",   50.0, 40.0,  75.0,  80.0),
-            ("ambient_temperature",  "Ambient Temp",  "°C",  15.0, None,  40.0,  45.0),
-            ("ambient_humidity",     "Humidity",      "%",   30.0, None,  85.0,  95.0),
-        ]
-        for (param, label, unit, lw, lc, hw, hc) in defaults:
+        for (param, label, unit, lw, lc, hw, hc, stype, interp) in defaults:
             conn.execute("""INSERT OR IGNORE INTO thresholds
-                (param,label,unit,low_warn,low_crit,high_warn,high_crit,enabled,updated_at)
-                VALUES (?,?,?,?,?,?,?,1,?)""",
-                (param, label, unit, lw, lc, hw, hc, datetime.now().isoformat()))
+                (param, label, unit, low_warn, low_crit, high_warn, high_crit, 
+                 sensor_type, interpretation, enabled, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,1,?)""",
+                (param, label, unit, lw, lc, hw, hc, stype, interp, datetime.now().isoformat()))
+        conn.commit()
+    else:
+        # Backward-compatible migration:
+        # Update ONLY if values still match previous seeded defaults,
+        # so we don't override any custom thresholds the admin/farmer set.
+        now_iso = datetime.now().isoformat()
+        # Detect which columns exist in your current DB (older DBs may not have sensor_type).
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(thresholds)").fetchall()}
+
+        # Ensure required sensor threshold rows exist (some older DBs may not have them).
+        existing_params = {r["param"] for r in conn.execute("SELECT param FROM thresholds").fetchall()}
+        required_params = {"temperature", "ph", "methane_raw", "pressure"}
+
+        for (param, label, unit, lw, lc, hw, hc, stype, interp) in defaults:
+            if param not in required_params:
+                continue
+            if param in existing_params:
+                continue
+
+            insert_cols = []
+            insert_vals = []
+            if "param" in cols:
+                insert_cols.append("param"); insert_vals.append(param)
+            if "label" in cols:
+                insert_cols.append("label"); insert_vals.append(label)
+            if "unit" in cols:
+                insert_cols.append("unit"); insert_vals.append(unit)
+            if "low_warn" in cols:
+                insert_cols.append("low_warn"); insert_vals.append(lw)
+            if "low_crit" in cols:
+                insert_cols.append("low_crit"); insert_vals.append(lc)
+            if "high_warn" in cols:
+                insert_cols.append("high_warn"); insert_vals.append(hw)
+            if "high_crit" in cols:
+                insert_cols.append("high_crit"); insert_vals.append(hc)
+            if "sensor_type" in cols:
+                insert_cols.append("sensor_type"); insert_vals.append(stype)
+            if "interpretation" in cols:
+                insert_cols.append("interpretation"); insert_vals.append(interp)
+            if "enabled" in cols:
+                insert_cols.append("enabled"); insert_vals.append(1)
+            if "updated_at" in cols:
+                insert_cols.append("updated_at"); insert_vals.append(now_iso)
+
+            if insert_cols:
+                placeholders = ",".join(["?"] * len(insert_vals))
+                sql = f"INSERT OR IGNORE INTO thresholds ({','.join(insert_cols)}) VALUES ({placeholders})"
+                conn.execute(sql, tuple(insert_vals))
+                existing_params.add(param)
+
+        def exec_update(param: str, updates: dict, where_sql: str, where_params: tuple):
+            # Only update columns that exist in the DB schema.
+            updates = {k: v for k, v in updates.items() if k in cols}
+            if not updates:
+                return
+
+            set_sql = ", ".join(f"{k}=?" for k in updates.keys())
+            params = list(updates.values())
+
+            if "updated_at" in cols:
+                set_sql = set_sql + ", updated_at=?"
+                params.append(now_iso)
+
+            sql = f"UPDATE thresholds SET {set_sql} WHERE {where_sql}"
+            conn.execute(sql, tuple(params + list(where_params)))
+
+        # temperature: old (15/10, 40/43) -> new (20/10, 30/40)
+        exec_update(
+            "temperature",
+            updates={
+                "low_warn": 20.0,
+                "low_crit": 10.0,
+                "high_warn": 30.0,
+                "high_crit": 40.0,
+                "label": "Digester Temperature",
+                "unit": "°C",
+                "sensor_type": "DS18B20",
+                "interpretation": "Optimal: 20-30°C (soil/water) or 30-40°C (biogas mesophilic)",
+            },
+            where_sql="param='temperature' AND low_warn=? AND low_crit=? AND high_warn=? AND high_crit=?",
+            where_params=(15.0, 10.0, 40.0, 43.0),
+        )
+
+        # ph: old (6/5, 8.5/9) -> new (6/4, 8.5/10)
+        exec_update(
+            "ph",
+            updates={
+                "low_warn": 6.0,
+                "low_crit": 4.0,
+                "high_warn": 8.5,
+                "high_crit": 10.0,
+                "label": "Digester pH Level",
+                "unit": "",
+                "sensor_type": "DFRobot_pH",
+                "interpretation": "Optimal: 6.8-7.5 (biogas). Soil: 6.0-7.0. Water: 6.5-8.5",
+            },
+            where_sql="param='ph' AND low_warn=? AND low_crit=? AND high_warn=? AND high_crit=?",
+            where_params=(6.0, 5.0, 8.5, 9.0),
+        )
+
+        # methane_raw: old (3000/NULL, 24000/32000) -> new (8000/3000, 16000/24000)
+        exec_update(
+            "methane_raw",
+            updates={
+                "low_warn": 8000.0,
+                "low_crit": 3000.0,
+                "high_warn": 16000.0,
+                "high_crit": 24000.0,
+                "label": "Methane Sensor (Raw)",
+                "unit": "ADC",
+                "sensor_type": "MQ5",
+                "interpretation": "0-200 ppm: clean | 200-1000 ppm: low | 1000-3000 ppm: moderate | 3000-6000 ppm: high | >6000 ppm: dangerous",
+            },
+            where_sql="param='methane_raw' AND low_warn=? AND low_crit IS NULL AND high_warn=? AND high_crit=?",
+            where_params=(3000.0, 24000.0, 32000.0),
+        )
+
+        # Apply your required sensor threshold spec unconditionally
+        # (overrides any older default values so your alerts match exactly).
+        exec_update(
+            "temperature",
+            updates={
+                "low_warn": 20.0,
+                "low_crit": 10.0,
+                "high_warn": 30.0,
+                "high_crit": 40.0,
+                "label": "Digester Temperature",
+                "unit": "°C",
+                "sensor_type": "DS18B20",
+                "interpretation": "Optimal: 20-30°C (soil/water) or 30-40°C (biogas mesophilic)",
+            },
+            where_sql="param=?",
+            where_params=("temperature",),
+        )
+
+        exec_update(
+            "ph",
+            updates={
+                "low_warn": 6.0,
+                "low_crit": 4.0,
+                "high_warn": 8.5,
+                "high_crit": 10.0,
+                "label": "Digester pH Level",
+                "unit": "",
+                "sensor_type": "DFRobot_pH",
+                "interpretation": "Optimal: 6.8-7.5 (biogas). Soil: 6.0-7.0. Water: 6.5-8.5",
+            },
+            where_sql="param=?",
+            where_params=("ph",),
+        )
+
+        exec_update(
+            "methane_raw",
+            updates={
+                "low_warn": 8000.0,
+                "low_crit": 3000.0,
+                "high_warn": 16000.0,
+                "high_crit": 24000.0,
+                "label": "Methane Sensor (Raw)",
+                "unit": "ADC",
+                "sensor_type": "MQ5",
+                "interpretation": "0-200 ppm: clean | 200-1000 ppm: low | 1000-3000 ppm: moderate | 3000-6000 ppm: high | >6000 ppm: dangerous",
+            },
+            where_sql="param=?",
+            where_params=("methane_raw",),
+        )
+
+        exec_update(
+            "pressure",
+            updates={
+                "low_warn": 80.0,
+                "low_crit": 50.0,
+                "high_warn": 130.0,
+                "high_crit": 150.0,
+                "label": "Digester Pressure",
+                "unit": "kPa",
+                "sensor_type": "Pressure",
+                "interpretation": "Normal range: 80-130 kPa. Monitor for leaks/blockages.",
+            },
+            where_sql="param=?",
+            where_params=("pressure",),
+        )
+
         conn.commit()
     conn.close()
 
@@ -451,19 +787,24 @@ CROP_CYCLE_CATALOG = {
 DEFAULT_USER_CROPS = ["pulses", "groundnut", "soybean"]
 
 def _latest_sensor_and_npk():
-    """Return latest live sensor and best-available NPK values."""
+    """Return latest live sensor and NPK values from sensor_readings."""
     conn = get_db()
-    sensor = conn.execute("""SELECT temperature, ph, pressure, gas_flow, timestamp
+    sensor = conn.execute("""SELECT temperature, ph, pressure, gas_flow,
+        nitrogen_concentration, phosphorus_concentration, potassium_concentration,
+        timestamp
         FROM sensor_readings ORDER BY id DESC LIMIT 1""").fetchone()
-    pred = conn.execute("""SELECT nitrogen_pct, nitrogen_level, timestamp
-        FROM prediction_results ORDER BY id DESC LIMIT 1""").fetchone()
     conn.close()
 
     sensor_d = dict(sensor) if sensor else {}
-    if pred and pred["nitrogen_pct"] is not None:
-        n_est = float(pred["nitrogen_pct"]) * 10000
-    else:
-        n_est = 2000.0
+    def _f(val, default):
+        try:
+            return default if val is None else float(val)
+        except Exception:
+            return default
+
+    n_est = _f(sensor_d.get("nitrogen_concentration"), 2000.0)
+    p_est = _f(sensor_d.get("phosphorus_concentration"), 500.0)
+    k_est = _f(sensor_d.get("potassium_concentration"), 1200.0)
 
     return {
         "temperature": float(sensor_d.get("temperature", 30.0)),
@@ -471,8 +812,8 @@ def _latest_sensor_and_npk():
         "pressure": float(sensor_d.get("pressure", 100.0)),
         "gas_flow": float(sensor_d.get("gas_flow", 3.0)),
         "n": float(n_est),
-        "p": 500.0,
-        "k": 1200.0,
+        "p": float(p_est),
+        "k": float(k_est),
         "timestamp": sensor_d.get("timestamp", datetime.now().isoformat()),
     }
 
@@ -563,11 +904,335 @@ def build_crop_cycle_predictions(crops: list, state: str, soil_type: str, start_
 # ══════════════════════════════════════════════════════════════════════════════
 # ── ALERT RULES — dynamic, driven by threshold table ─────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# ── SENSOR-SPECIFIC ADVISORY SYSTEM ───────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+def get_sensor_advisory(alert: dict) -> str:
+    """
+    Generate sensor-specific advisory/response messages based on alert details.
+    Returns actionable guidance for farmers.
+    """
+    param = alert.get("param", "")
+    value = alert.get("value", 0)
+    severity = alert.get("severity", "")
+    direction = alert.get("direction", "")
+    sensor_type = alert.get("sensor_type", "")
+    
+    advisories = {
+        # ── TEMPERATURE ADVISORIES (DS18B20) ──────────────────────────────
+        "temperature": {
+            "critical_low": (
+                "🔴 CRITICAL: Temperature too low (<10°C)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Check insulation around digester\n"
+                "  2. Verify heater is functioning (if installed)\n"
+                "  3. Increase feed frequency to generate more heat\n"
+                "  4. Consider adding preheated water/slurry\n"
+                "⏱️  Action needed: Next 4-6 hours\n"
+                "❓ Impact: Microbial activity drops dramatically below 10°C"
+            ),
+            "warning_low": (
+                "⚠️ WARNING: Temperature below optimal (10-20°C)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Inspect digester insulation\n"
+                "  2. Increase ambient/preheating if winter\n"
+                "  3. Add C:N rich feed to boost decomposition heat\n"
+                "  4. Check ventilation (excess air loss lowers temp)\n"
+                "⏱️  Action needed: Within 12-24 hours\n"
+                "ℹ️  Optimal for soil/water: 15-25°C. For biogas: 30-40°C"
+            ),
+            "warning_high": (
+                "⚠️ WARNING: Temperature elevated (30-40°C)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Improve ventilation to cool digester\n"
+                "  2. Check for excessive sunlight exposure\n"
+                "  3. Reduce feed frequency temporarily\n"
+                "  4. Monitor for accelerated gas production\n"
+                "⏱️  Action needed: Monitor over 24-48 hours\n"
+                "ℹ️  This may increase gas yield if controlled"
+            ),
+            "critical_high": (
+                "🔴 CRITICAL: Temperature critical (>40°C)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Stop adding fresh feed immediately\n"
+                "  2. Increase ventilation/cooling NOW\n"
+                "  3. Spray water on digester exterior if needed\n"
+                "  4. Check for fire hazards near digester\n"
+                "⏱️  Action needed: IMMEDIATE (within 1-2 hours)\n"
+                "❌ Risk: Thermophilic conditions can kill microbes if temp oscillates"
+            ),
+        },
+        
+        # ── pH ADVISORIES (DFRobot) ──────────────────────────────────────
+        "ph": {
+            "critical_low": (
+                "🔴 CRITICAL: pH too acidic (<4.0)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Add alkalizing agent:\n"
+                "     • Calcium carbonate (CaCO3): 5-10 kg/1000L\n"
+                "     • Lime slurry: 2-5 kg/1000L\n"
+                "     • Wood ash: 3-8 kg/1000L\n"
+                "  2. Reduce feed rate by 50% until recovery\n"
+                "  3. Increase mixing frequency\n"
+                "  4. Monitor pH daily until >6.5\n"
+                "⏱️  Action needed: IMMEDIATE (within 2-4 hours)\n"
+                "⚡ Cause: Excessive VFA (volatile fatty acids). Check overfeeding."
+            ),
+            "warning_low": (
+                "⚠️ WARNING: pH slightly acidic (4.0-6.0)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Add small dose of calcium carbonate (2-3 kg/1000L)\n"
+                "  2. Reduce feed frequency slightly\n"
+                "  3. Check C:N ratio in feedstock\n"
+                "  4. Re-measure pH in 6-12 hours\n"
+                "⏱️  Action needed: Within 12 hours\n"
+                "ℹ️  Trend: If pH is dropping, acid accumulation is occurring"
+            ),
+            "warning_high": (
+                "⚠️ WARNING: pH slightly alkaline (8.5-10.0)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Add small amount of acidifying feedstock:\n"
+                "     • Vinegar: 0.5-1% by volume\n"
+                "     • Whey/dairy waste: 5-10% addition\n"
+                "  2. Increase feed rate gradually\n"
+                "  3. Check for ammonia odors (N2 loss)\n"
+                "  4. Monitor in 12-24 hours\n"
+                "⏱️  Action needed: Within 24 hours\n"
+                "⚠️  Ammonia loss occurs at high pH + high temp"
+            ),
+            "critical_high": (
+                "🔴 CRITICAL: pH strongly alkaline (>10.0)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Add acidifying material urgently:\n"
+                "     • Vinegar/uric acid solution: 2-5% by volume\n"
+                "     • Whey: 15-20% replacement feed\n"
+                "  2. STOP adding any alkaline material\n"
+                "  3. Reduce overall feed rate temporarily\n"
+                "  4. Monitor PT daily until pH <8.5\n"
+                "⏱️  Action needed: IMMEDIATE (within 1-2 hours)\n"
+                "❌ Risk: Ammonia toxicity, process failure if not corrected"
+            ),
+        },
+        
+        # ── PRESSURE ADVISORIES ──────────────────────────────────────────
+        "pressure": {
+            "critical_low": (
+                "🔴 CRITICAL: Pressure critically low (<50 kPa)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Check for leaks in digester seals/valves\n"
+                "  2. Inspect all connections (tighten if loose)\n"
+                "  3. Test for gas leakage with soapy water\n"
+                "  4. If no leaks found: may indicate blockage in outlet\n"
+                "⏱️  Action needed: IMMEDIATE investigation\n"
+                "⚠️  Loss of pressure = loss of gas containment"
+            ),
+            "warning_low": (
+                "⚠️ WARNING: Pressure low (50-80 kPa)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Inspect all seals for minor leaks\n"
+                "  2. Check pressure gauge calibration\n"
+                "  3. Increase feed slightly to boost gas production\n"
+                "  4. Verify gas outlet is not blocked\n"
+                "⏱️  Action needed: Within 12-24 hours\n"
+                "ℹ️  May indicate reduced gas production (low temp? Low feed?)"
+            ),
+            "warning_high": (
+                "⚠️ WARNING: Pressure elevated (130-150 kPa)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Open pressure relief valve (if installed)\n"
+                "  2. Increase gas utilization (more stove use)\n"
+                "  3. Check for blocked outlet\n"
+                "  4. Monitor for overpressure (>150 kPa)\n"
+                "⏱️  Action needed: Within 24 hours\n"
+                "ℹ️  Extra gas = extra energy. Use it, or vent safely."
+            ),
+            "critical_high": (
+                "🔴 CRITICAL: Pressure critical (>150 kPa)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. RELEASE PRESSURE IMMEDIATELY via relief valve\n"
+                "  2. Do NOT ignite gas until pressure normalized\n"
+                "  3. Increase gas utilization rate\n"
+                "  4. Check for blockages in piping\n"
+                "  5. Verify digester integrity (no cracks)\n"
+                "⏱️  Action needed: IMMEDIATE (within 15-30 minutes)\n"
+                "🚨 Risk: Digester rupture, explosion hazard"
+            ),
+        },
+        
+        # ── METHANE/MQ5 ADVISORIES (ADS1115 raw value 0-32767) ─────────
+        "methane_raw": {
+            "critical_low": (
+                "🔴 CRITICAL: Methane extremely low (<200 ppm)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Check digester gas production (feed rate, mixing)\n"
+                "  2. Verify methane sensor burn-in (24-48h)\n"
+                "  3. Inspect MQ5 wiring and sensor saturation/blockage\n"
+                "  4. Check for leaks or abnormal digester process\n"
+                "⏱️  Action needed: Within 24-48 hours\n"
+                "⚠️ Low methane can reduce cooking/energy output"
+            ),
+            "warning_low": (
+                "⚠️ WARNING: Methane low (<1000 ppm)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Check MQ5 sensor burn-in (needs 24-48h)\n"
+                "  2. Verify sensor is not saturated or blocked\n"
+                "  3. Check for sensor wiring/connection issues\n"
+                "  4. Ensure digester is producing gas\n"
+                "⏱️  Action needed: Within 24-48 hours\n"
+                "ℹ️  May be normal if digester was just started"
+            ),
+            "warning_high": (
+                "⚠️ WARNING: Methane elevated (3000–6000 ppm, ventilate if needed)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Ensure adequate ventilation\n"
+                "  2. Avoid naked flames/sparks in digester area\n"
+                "  3. Use gas safely or flare excess\n"
+                "  4. Monitor for leaks (gas should be contained)\n"
+                "⏱️  Action needed: Monitor over 24 hours\n"
+                "⚡ Good production! Use the gas for cooking/electricity."
+            ),
+            "critical_high": (
+                "🔴 CRITICAL: Methane dangerous (>6000 ppm)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. EVACUATE digester area immediately\n"
+                "  2. Stop all ignition sources\n"
+                "  3. Increase ventilation drastically\n"
+                "  4. Check for major gas leak/blockage\n"
+                "  5. Do NOT enter digester area until below 1000 ppm\n"
+                "⏱️  Action needed: IMMEDIATE evacuation\n"
+                "🚨 Risk: Methane is explosive 5-15% in air. LEL zone detected."
+            ),
+        },
+        
+        # ── GAS FLOW ADVISORIES ──────────────────────────────────────────
+        "gas_flow": {
+            "critical_low": (
+                "🔴 CRITICAL: Gas flow critically low (<0.5 L/h)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Check digester temperature (should be >15°C)\n"
+                "  2. Verify feedstock is being added\n"
+                "  3. Inspect outlet for blockage/ice\n"
+                "  4. Check water level in digester\n"
+                "  5. Trouble: May indicate digester failure\n"
+                "⏱️  Action needed: IMMEDIATE investigation\n"
+                "⚠️  Minimum viable flow: 1 L/h for energy utility"
+            ),
+            "warning_low": (
+                "⚠️ WARNING: Gas flow low (0.5-1.5 L/h)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Check temperature (consider heating)\n"
+                "  2. Increase feed rate gradually\n"
+                "  3. Check mixing/agitation system\n"
+                "  4. Verify pH is optimal (6.8-7.5)\n"
+                "  5. Reduce system leakage if possible\n"
+                "⏱️  Action needed: Within 24-48 hours\n"
+                "ℹ️  Low flow = low energy output. May need process tuning."
+            ),
+        },
+        
+        # ── NITROGEN ADVISORIES ──────────────────────────────────────────
+        "nitrogen_concentration": {
+            "critical_low": (
+                "🔴 CRITICAL: Nitrogen critically low (<1000 mg/kg)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Add nitrogen-rich feedstock:\n"
+                "     • Poultry litter: 10-20% by weight\n"
+                "     • Fresh manure: 30-40%\n"
+                "     • Urea: 0.5-1 kg/1000L carefully\n"
+                "  2. Reduce C:N ratio temporarily\n"
+                "  3. Monitor gas production recovery\n"
+                "⏱️  Action needed: Within 12-24 hours\n"
+                "⚠️  Nitrogen starvation → microbial shutdown"
+            ),
+            "warning_low": (
+                "⚠️ WARNING: Nitrogen low (1000-1500 mg/kg)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Add nitrogen source gradually:\n"
+                "     • Manure: 20-30% of feed mix\n"
+                "     • Crop residue: reduce proportion\n"
+                "  2. Check C:N ratio (should be 20-30:1)\n"
+                "  3. Monitor pressure & gas yield\n"
+                "⏱️  Action needed: Within 12 hours\n"
+                "ℹ️  May improve if mixing/pretreatment changed"
+            ),
+            "warning_high": (
+                "⚠️ WARNING: Nitrogen high (3000+ mg/kg)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Reduce manure/poultry litter in feedstock\n"
+                "  2. Increase C:N ratio (add more crop residue)\n"
+                "  3. Watch for ammonia odors\n"
+                "  4. Monitor pH (high N + high pH → ammonia loss)\n"
+                "  5. Increase dilution/water ratio\n"
+                "⏱️  Action needed: Over next 48-72 hours\n"
+                "⚠️  High N with high temp = ammonia volatilization"
+            ),
+        },
+        
+        # ── PHOSPHORUS ADVISORIES ────────────────────────────────────────
+        "phosphorus_concentration": {
+            "critical_low": (
+                "🔴 CRITICAL: Phosphorus critically low (<300 mg/kg)\n"
+                "IMMEDIATE ACTIONS:\n"
+                "  1. Add phosphorus source:\n"
+                "     • Phosphate rock: 2-5 kg/1000L\n"
+                "     • Bone meal: 3-6 kg/1000L\n"
+                "     • Poultry litter: 15-25%\n"
+                "  2. Verify feedstock sources\n"
+                "⏱️  Action needed: Within 12-24 hours\n"
+                "⚠️  P deficiency → poor cell growth"
+            ),
+            "warning_low": (
+                "⚠️ WARNING: Phosphorus low (300-420 mg/kg)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Add phosphate-rich feed gradually\n"
+                "  2. Consider phosphate rock amendment (1-2 kg/1000L)\n"
+                "  3. Monitor compost output quality\n"
+                "⏱️  Action needed: Within 24-48 hours"
+            ),
+        },
+        
+        # ── POTASSIUM ADVISORIES ─────────────────────────────────────────
+        "potassium_concentration": {
+            "critical_low": (
+                "⚠️ WARNING: Potassium low (<50 mg/kg)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Add potassium source:\n"
+                "     • K-rich crop residue: increase proportion\n"
+                "     • Wood ash: 2-4 kg/1000L (carefully, may raise pH)\n"
+                "     • Plant waste: 10-20%\n"
+                "  2. Monitor pH if adding ash\n"
+                "⏱️  Action needed: Within 24-48 hours\n"
+                "ℹ️  Potassium important for soil conditioning"
+            ),
+            "warning_high": (
+                "⚠️ WARNING: Potassium high (>100 mg/kg)\n"
+                "RECOMMENDED ACTIONS:\n"
+                "  1. Reduce K-rich inputs (wood ash, K-fertilizer)\n"
+                "  2. Balance with crop residue low in K\n"
+                "  3. Monitor compost application rates\n"
+                "⏱️  Action needed: Over next 7 days"
+            ),
+        },
+    }
+    
+    # Get base advisory for this parameter
+    param_advisories = advisories.get(param, {})
+    
+    # Construct key: "<severity>_<direction>"
+    if severity and direction:
+        advisory_key = f"{severity}_{direction}"
+        return param_advisories.get(advisory_key, 
+            f"Contact technical support for {param} at {severity} level.")
+    
+    return f"{param} requires attention. Check sensor and system status."
+
+
 def check_alerts(sensor: dict, ts: str = None) -> list:
     """
     Compare sensor reading against DB thresholds.
     Returns list of alert dicts with full details for notification.
-    Each alert contains: param, label, unit, value, low/high limits, severity, message, timestamp.
+    Each alert contains: param, label, unit, value, low/high limits, severity, message, 
+                        sensor_type, interpretation, advisory, timestamp.
     """
     ts      = ts or datetime.now().isoformat()
     thrs    = get_thresholds()
@@ -583,6 +1248,18 @@ def check_alerts(sensor: dict, ts: str = None) -> list:
         high_crit = thr.get("high_crit")
         label     = thr["label"]
         unit      = thr["unit"]
+        sensor_type = thr.get("sensor_type", "Generic")
+        interpretation = thr.get("interpretation", "")
+
+        # Display conversion: MQTT/UI now wants methane in ppm-only (no raw ADC anywhere).
+        # Severity/direction are still computed using raw thresholds from DB.
+        display_label = label
+        display_unit  = unit
+        display_val   = val
+        if param == "methane_raw":
+            display_label = "Methane (MQ5)"
+            display_unit  = "ppm"
+            display_val   = mq5_raw_to_ppm(val)
 
         severity = None
         direction = None
@@ -599,33 +1276,60 @@ def check_alerts(sensor: dict, ts: str = None) -> list:
         if severity:
             if direction == "low":
                 limit_used = low_crit if severity == "critical" else low_warn
-                msg = (f"{label} is too low: {val}{unit} "
-                       f"(limit: ≥ {limit_used}{unit})")
+                display_limit_used = limit_used
+                if param == "methane_raw":
+                    display_limit_used = mq5_raw_to_ppm(limit_used)
+                msg = (f"{display_label} is too low: {display_val} {display_unit} "
+                       f"(critical limit: ≥ {display_limit_used} {display_unit})")
             else:
                 limit_used = high_crit if severity == "critical" else high_warn
-                msg = (f"{label} is too high: {val}{unit} "
-                       f"(limit: ≤ {limit_used}{unit})")
+                display_limit_used = limit_used
+                if param == "methane_raw":
+                    display_limit_used = mq5_raw_to_ppm(limit_used)
+                msg = (f"{display_label} is too high: {display_val} {display_unit} "
+                       f"(critical limit: ≤ {display_limit_used} {display_unit})")
 
-            alerts.append({
-                "param":      param,
-                "label":      label,
-                "unit":       unit,
-                "value":      val,
-                "direction":  direction,
-                "severity":   severity,
-                "message":    msg,
-                "low_warn":   low_warn,
-                "low_crit":   low_crit,
-                "high_warn":  high_warn,
-                "high_crit":  high_crit,
-                "timestamp":  ts,
-            })
+            # Convert thresholds for display when methane is ppm-only.
+            disp_low_warn = low_warn
+            disp_low_crit = low_crit
+            disp_high_warn = high_warn
+            disp_high_crit = high_crit
+            if param == "methane_raw":
+                disp_low_warn  = mq5_raw_to_ppm(low_warn)  if low_warn  is not None else None
+                disp_low_crit  = mq5_raw_to_ppm(low_crit)  if low_crit  is not None else None
+                disp_high_warn = mq5_raw_to_ppm(high_warn) if high_warn is not None else None
+                disp_high_crit = mq5_raw_to_ppm(high_crit) if high_crit is not None else None
+
+            # Build alert with sensor-specific advisory
+            alert_dict = {
+                "param":         param,
+                "label":         display_label,
+                "unit":          display_unit,
+                "value":         display_val,
+                "direction":     direction,
+                "severity":      severity,
+                "message":       msg,
+                "low_warn":      disp_low_warn,
+                "low_crit":      disp_low_crit,
+                "high_warn":     disp_high_warn,
+                "high_crit":     disp_high_crit,
+                "sensor_type":   sensor_type,
+                "interpretation": interpretation,
+                "timestamp":     ts,
+            }
+            
+            # Add sensor-specific advisory
+            alert_dict["advisory"] = get_sensor_advisory(alert_dict)
+            
+            alerts.append(alert_dict)
+    
     return alerts
 
 
 def build_alert_notification(alerts: list, farmer_name: str = "") -> tuple:
     """
-    Build a full email body and short SMS string from a list of alert dicts.
+    Build full email body and SMS string from alert list.
+    Includes sensor-specific advisories, thresholds, and actionable recommendations.
     Returns (email_subject, email_body, sms_text).
     """
     ts    = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -636,33 +1340,96 @@ def build_alert_notification(alerts: list, farmer_name: str = "") -> tuple:
                else "⚠️ Digester Warning") + f" — {ts}"
 
     lines = [
-        f"🌿 Urja Nidhi — Digester Alert",
-        f"Farmer: {farmer_name}",
+        f"🌿 Urja Nidhi — Sensor Alert Report",
+        f"Farmer: {farmer_name or 'Registered User'}",
         f"Time  : {ts}",
-        "─" * 45,
+        "═" * 70,
+        "",
+    ]
+    
+    # Add summary
+    if crit:
+        lines.append(f"🚨 {len(crit)} CRITICAL ALERT(S) — IMMEDIATE ACTION REQUIRED")
+        lines.append("")
+    if warn:
+        lines.append(f"⚠️  {len(warn)} WARNING(S) — MONITOR & PLAN ACTION")
+        lines.append("")
+    
+    lines.append("─" * 70)
+    lines.append("")
+    
+    # Detailed alerts with advisories
+    for i, a in enumerate(alerts, 1):
+        icon = "🚨" if a["severity"] == "critical" else "⚠️"
+        lines.append(f"{icon} ALERT #{i}: {a['label']}")
+        lines.append(f"   Sensor Type   : {a.get('sensor_type', 'Unknown')}")
+        lines.append(f"   Current Value : {a['value']} {a['unit']}")
+        lines.append(f"   Status        : {a['severity'].upper()} ({a['direction'].upper()})")
+        lines.append(f"   Description   : {a['message']}")
+        
+        # Add limits
+        if a.get('low_crit')   is not None: lines.append(f"   🔴 Critical Low   : {a['low_crit']} {a['unit']}")
+        if a.get('low_warn')   is not None: lines.append(f"   🟠 Warning Low    : {a['low_warn']} {a['unit']}")
+        if a.get('high_warn')  is not None: lines.append(f"   🟠 Warning High   : {a['high_warn']} {a['unit']}")
+        if a.get('high_crit')  is not None: lines.append(f"   🔴 Critical High  : {a['high_crit']} {a['unit']}")
+        
+        # Add interpretation
+        if a.get('interpretation'):
+            lines.append(f"   Background    : {a['interpretation']}")
+        
+        lines.append("")
+        lines.append(f"   📋 ACTION PLAN:")
+        lines.append("   " + "─" * 65)
+        
+        # Add sensor-specific advisory (formatted)
+        advisory = a.get('advisory', 'No specific advisory available.')
+        advisory_lines = advisory.split('\n')
+        for adv_line in advisory_lines:
+            lines.append(f"   {adv_line}")
+        
+        lines.append("")
+        lines.append("")
+    
+    lines += [
+        "═" * 70,
+        "📲 Next Steps:",
+        "  1. Review the ACTION PLAN for each alert above",
+        "  2. Take immediate action for CRITICAL alerts (within 1-4 hours)",
+        "  3. Monitor WARNING alerts over next 12-48 hours",
+        "  4. Log your actions in the Urja Nidhi dashboard",
+        "  5. Re-measure sensors after taking corrective action",
+        "",
+        "💡 Dashboard Link: http://localhost:5000",
+        "📞 Support: Contact your Urja Nidhi coordinator",
+        "",
+        "─ Urja Nidhi Smart Digester Monitoring System",
+    ]
+    
+    # Short email body: one line per alert + first advisory line.
+    # (User requested shorter alerts in email.)
+    short_lines = [
+        f"🌿 Urja Nidhi — {subject}",
+        f"Time:  {ts}",
         "",
     ]
     for a in alerts:
-        icon = "🚨" if a["severity"] == "critical" else "⚠️"
-        lines.append(f"{icon}  {a['label']}")
-        lines.append(f"    Current value : {a['value']} {a['unit']}")
-        if a["low_crit"]  is not None: lines.append(f"    Critical low  : {a['low_crit']} {a['unit']}")
-        if a["low_warn"]  is not None: lines.append(f"    Warning low   : {a['low_warn']} {a['unit']}")
-        if a["high_warn"] is not None: lines.append(f"    Warning high  : {a['high_warn']} {a['unit']}")
-        if a["high_crit"] is not None: lines.append(f"    Critical high : {a['high_crit']} {a['unit']}")
-        lines.append(f"    Status        : {a['severity'].upper()} — {a['message']}")
-        lines.append("")
+        adv = a.get("advisory") or ""
+        adv_first = adv.splitlines()[0].strip() if adv else ""
+        short_lines.append(f"- {a['label']}: {a['value']}{a['unit']} ({a['severity'].upper()})")
+        if adv_first:
+            short_lines.append(f"  Advice: {adv_first}")
+    short_lines.append("")
+    short_lines.append("Dashboard: http://localhost:5000")
+    email_body = "\n".join(short_lines)
 
-    lines += ["─" * 45,
-              "Login to your dashboard for details: http://localhost:5000",
-              "— Urja Nidhi Team"]
-    email_body = "\n".join(lines)
-
-    # Short SMS — max ~160 chars per alert
-    sms_parts = [f"Urja Nidhi Alert {ts}:"]
+    # Compact SMS (max ~160 chars per alert suggested)
+    sms_parts = [f"Urja Nidhi {ts}:"]
     for a in alerts:
-        sms_parts.append(f"{a['label']}: {a['value']}{a['unit']} ({a['severity'].upper()})")
-    sms_text = " | ".join(sms_parts)
+        sms_parts.append(
+            f"{a['label']}: {a['value']}{a['unit']} ({a['severity'].upper()}) "
+            f"limit:{a.get('low_crit') or a.get('low_warn') or a.get('high_warn') or a.get('high_crit')} "
+        )
+    sms_text = " | ".join(sms_parts[:3])  # Limit to 3 alerts in SMS
 
     return subject, email_body, sms_text
 
@@ -852,7 +1619,7 @@ def get_ai_advisory(question: str, sensor_context: dict = None) -> str:
             "contents": [{"parts": [{"text": ADVISORY_SYSTEM_PROMPT + "\n\n" + question + context_str}]}],
             "generationConfig": {"maxOutputTokens": 512, "temperature": 0.4}
         }).encode("utf-8")
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+        url = f"https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key={key}"
         req = urllib.request.Request(url, data=payload,
                                      headers={"Content-Type": "application/json"},
                                      method="POST")
@@ -860,7 +1627,8 @@ def get_ai_advisory(question: str, sensor_context: dict = None) -> str:
             result = json.loads(resp.read())
             return result["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as e:
-        return _rule_based_advisory(question, sensor_context) + f"\n\n(Gemini note: {e})"
+        print(f"⚠️  Gemini API error: {e}")
+        return _rule_based_advisory(question, sensor_context)
 
 def _rule_based_advisory(question: str, ctx: dict = None) -> str:
     q   = question.lower()
@@ -876,6 +1644,20 @@ def _rule_based_advisory(question: str, ctx: dict = None) -> str:
         return "Keep digester at 35–40°C for maximum gas. Insulate in winter."
     if any(w in q for w in ["fertilizer","urea","manure","npk","nitrogen","khad"]):
         return "Digested slurry = excellent fertilizer. 1 m³ biogas → 0.9 kg urea equivalent (saves ₹22/kg). Dilute 1:1 with water before applying."
+    # Feedstock / waste selection (cow dung vs poultry litter)
+    if any(w in q for w in ["cow dung", "cow manure", "dung", "poultry litter", "poultry", "waste", "feedstock", "slurry", "manure"]):
+        if "poultry" in q:
+            return (
+                "For biogas, start mainly with cow dung (best stable microbes). "
+                "Poultry litter can work, but it needs careful handling: pre-compost/ferment it 24–72h, "
+                "use only ~10–20% of daily feed at first (rest cow dung + water), and keep pH ~6.8–7.2. "
+                "Reduce poultry fraction immediately if smell/ammonia increases."
+            )
+        return (
+            "Best waste for biogas (stable digestion): cow dung. "
+            "Mix with water to make slurry (~1:1 to 1:1.5), feed daily, and aim for 35–40°C. "
+            "Start with small batches and monitor pH every day for the first week."
+        )
     if any(w in q for w in ["gas","biogas","production","low","less","kam"]):
         return "Low gas? Check: (1) pH 6.8–7.2, (2) Temp 35–40°C, (3) Feed 50–60 kg daily, (4) No pipe leaks."
     if any(w in q for w in ["save","money","cost","profit","paisa"]):
@@ -1113,7 +1895,8 @@ def predict_auto():
         return jsonify({"error": "Model not loaded. Run train_model.py first."}), 503
     try:
         conn = get_db()
-        row  = conn.execute("""SELECT temperature, ph, pressure, gas_flow
+        row  = conn.execute("""SELECT digester_id, temperature, ph, pressure, gas_flow,
+            nitrogen_concentration, phosphorus_concentration, potassium_concentration
             FROM sensor_readings ORDER BY id DESC LIMIT 1""").fetchone()
         conn.close()
 
@@ -1121,19 +1904,24 @@ def predict_auto():
             return jsonify({"error": "No sensor data yet. Use Live Sensors → Manual Entry or wait for IoT feed."}), 400
 
         # Build payload from latest sensor + sensible defaults
+        # sqlite3.Row supports dict-style indexing; `.get()` may not exist.
+        digester_id = row["digester_id"] if row and "digester_id" in row.keys() else "DIG001"
         data = {
             "waste_quantity": 50, "cn_ratio": 25, "moisture_level": 70,
             "temperature": float(row["temperature"] or 36),
             "ph": float(row["ph"] or 7.0),
             "retention_time": 25, "gas_flow_rate": float(row["gas_flow"] or 3.5),
             "methane_concentration": 60, "ambient_temperature": 28, "ambient_humidity": 70,
-            "nitrogen_concentration": 2000, "phosphorus_concentration": 500,
-            "potassium_concentration": 1200, "microbial_activity": 1500000,
+            # Use live N/P/K from sensor_readings (not hardcoded defaults).
+            "nitrogen_concentration": float(row["nitrogen_concentration"] or 2000),
+            "phosphorus_concentration": float(row["phosphorus_concentration"] or 500),
+            "potassium_concentration": float(row["potassium_concentration"] or 1200),
+            "microbial_activity": 1500000,
             "soil_n_requirement": 30, "manure_equivalent_n": 20,
             "external_fertilizer_required": 10, "waste_collection_cost": 60,
             "digester_operating_cost": 40,
             "waste_type": "cow_dung", "pre_treatment": "raw", "crop_type": "chickpea",
-            "digester_id": "DIG001",
+            "digester_id": digester_id,
         }
         feat  = build_feature_df(data)
         raw   = float(model.predict(feat)[0])
@@ -1141,6 +1929,8 @@ def predict_auto():
         ana   = compute_analytics(daily)
         ph    = data["ph"]
         n_conc = data["nitrogen_concentration"]
+        p_conc = data["phosphorus_concentration"]
+        k_conc = data["potassium_concentration"]
         comp_label, comp_score = classify_compost(daily, ph)
         alerts = check_alerts({"ph": ph, "temperature": data["temperature"], "gas_flow": data["gas_flow_rate"]})
         result = {
@@ -1148,6 +1938,11 @@ def predict_auto():
             "weekly_biogas_m3": ana["weekly_biogas_m3"],
             "nitrogen_level":   classify_nitrogen(n_conc),
             "nitrogen_pct":     round(n_conc / 10000, 3),
+            # Expose live NPK so the UI can display correct values.
+            "npk": {"n": n_conc, "p": p_conc, "k": k_conc},
+            "nitrogen_concentration": n_conc,
+            "phosphorus_concentration": p_conc,
+            "potassium_concentration": k_conc,
             "compost_quality":  comp_label,
             "compost_score":    comp_score,
             "analytics":        ana,
@@ -1160,7 +1955,7 @@ def predict_auto():
             (digester_id,daily_biogas,weekly_biogas,nitrogen_level,nitrogen_pct,
              compost_quality,compost_score,money_saved,energy_kwh,urea_equivalent,
              co2_reduction,cooking_hours,timestamp) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            ("DIG001", ana["daily_biogas_m3"], ana["weekly_biogas_m3"],
+            (digester_id, ana["daily_biogas_m3"], ana["weekly_biogas_m3"],
              result["nitrogen_level"], result["nitrogen_pct"], comp_label, comp_score,
              ana["money_saved_inr"], ana["energy_kwh"], ana["urea_equivalent_kg"],
              ana["co2_reduction_kg"], ana["cooking_hours"], result["timestamp"]))
@@ -1182,6 +1977,8 @@ def predict_latest():
             compost_quality, compost_score, money_saved, energy_kwh,
             urea_equivalent, co2_reduction, cooking_hours, timestamp
             FROM prediction_results ORDER BY id DESC LIMIT 1""").fetchone()
+        sensor = conn.execute("""SELECT nitrogen_concentration, phosphorus_concentration, potassium_concentration
+            FROM sensor_readings ORDER BY id DESC LIMIT 1""").fetchone()
         conn.close()
         if not row:
             return jsonify({"exists": False})
@@ -1189,6 +1986,18 @@ def predict_latest():
         daily = r.get("daily_biogas") or 0
         r["daily_biogas_m3"] = daily
         r["analytics"] = compute_analytics(daily)
+        if sensor:
+            n_conc = sensor.get("nitrogen_concentration")
+            p_conc = sensor.get("phosphorus_concentration")
+            k_conc = sensor.get("potassium_concentration")
+            r["npk"] = {
+                "n": float(n_conc) if n_conc is not None else 2000.0,
+                "p": float(p_conc) if p_conc is not None else 500.0,
+                "k": float(k_conc) if k_conc is not None else 1200.0,
+            }
+            r["nitrogen_concentration"] = r["npk"]["n"]
+            r["phosphorus_concentration"] = r["npk"]["p"]
+            r["potassium_concentration"] = r["npk"]["k"]
         r["exists"] = True
         r["alerts"] = []
         return jsonify(r)
@@ -1248,18 +2057,42 @@ def predict():
 def ingest_sensor():
     try:
         data = request.get_json(force=True)
+        # Required fields
         for f in ["temperature", "ph", "pressure", "gas_flow"]:
             if f not in data:
                 return jsonify({"error": f"Missing: {f}"}), 400
+        
         ts     = data.get("timestamp", datetime.now().isoformat())
-        alerts = check_alerts(data)
+        # Handle field name variants
+        temp = data.get("temperature", data.get("temperature_C", 30))
+        pres = data.get("pressure", data.get("pressure_kPa", 100))
+        
+        sensor_reading = {
+            "digester_id": data.get("digester_id", "DIG001"),
+            "temperature": float(temp),
+            "ph": float(data.get("ph", 7.0)),
+            "pressure": float(pres),
+            "gas_flow": float(data.get("gas_flow", 0)),
+            "methane_raw": float(data.get("methane_raw", data.get("methane_ppm", 0))),
+            "nitrogen_concentration": float(data.get("nitrogen_concentration", data.get("nitrogen_mgkg", 2000))),
+            "phosphorus_concentration": float(data.get("phosphorus_concentration", data.get("phosphorus_mgkg", 500))),
+            "potassium_concentration": float(data.get("potassium_concentration", data.get("potassium_mgkg", 1200))),
+        }
+        sensor_reading["methane_ppm"] = mq5_raw_to_ppm(sensor_reading["methane_raw"])
+        
+        alerts = check_alerts(sensor_reading)
         conn   = get_db()
         conn.execute("""INSERT INTO sensor_readings
-            (digester_id,temperature,ph,pressure,gas_flow,timestamp) VALUES (?,?,?,?,?,?)""",
-            (data.get("digester_id","DIG001"), data["temperature"],
-             data["ph"], data["pressure"], data["gas_flow"], ts))
+            (digester_id,temperature,ph,pressure,gas_flow,methane_raw,methane_ppm,
+             nitrogen_concentration,phosphorus_concentration,potassium_concentration,timestamp)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (sensor_reading["digester_id"], sensor_reading["temperature"],
+             sensor_reading["ph"], sensor_reading["pressure"], sensor_reading["gas_flow"],
+             sensor_reading["methane_raw"], sensor_reading["methane_ppm"],
+             sensor_reading["nitrogen_concentration"], sensor_reading["phosphorus_concentration"],
+             sensor_reading["potassium_concentration"], ts))
         conn.commit(); conn.close()
-        socketio.emit("sensor_update", {**data, "alerts": alerts, "timestamp": ts})
+        socketio.emit("sensor_update", {**sensor_reading, "alerts": alerts, "timestamp": ts})
         if alerts:
             threading.Thread(target=dispatch_alerts_to_all_farmers,
                              args=(alerts,), daemon=True).start()
@@ -1292,7 +2125,8 @@ def sensor_history():
     limit = request.args.get("limit", 50, type=int)
     try:
         conn = get_db()
-        rows = conn.execute("""SELECT temperature,ph,pressure,gas_flow,timestamp
+        rows = conn.execute("""SELECT temperature,ph,pressure,gas_flow,methane_raw,methane_ppm,
+            nitrogen_concentration,phosphorus_concentration,potassium_concentration,timestamp
             FROM sensor_readings ORDER BY id DESC LIMIT ?""", (limit,)).fetchall()
         conn.close()
         return jsonify([dict(r) for r in reversed(rows)])
@@ -1366,6 +2200,23 @@ def generate_pdf_report():
     """
     farmer = request.farmer
     days   = request.args.get("days", 7, type=int)
+    report_type = (request.args.get("type", "digester") or "digester").lower()
+    # Support download buttons for multiple report categories.
+    if report_type in ("weekly", "week"):
+        days = 7
+        report_title = "WEEKLY REPORT"
+    elif report_type in ("monthly", "month"):
+        days = 30
+        report_title = "MONTHLY REPORT"
+    elif report_type in ("daily", "daily_summary", "daily-summary"):
+        days = 1
+        report_title = "DAILY SUMMARY"
+    elif report_type in ("predictions", "prediction_alerts", "prediction-alerts"):
+        report_title = "PREDICTION REPORT"
+    elif report_type in ("thresholds", "threshold_alerts", "threshold-alerts"):
+        report_title = "THRESHOLD ALERT REPORT"
+    else:
+        report_title = "DIGESTER REPORT"
     try:
         conn = get_db()
         # Sensor averages
@@ -1383,11 +2234,54 @@ def generate_pdf_report():
             FROM prediction_results
             WHERE timestamp > datetime('now', ? || ' days')
         """, (f"-{days}",)).fetchone()
-        # Alert count
-        alerts_count = conn.execute("""
-            SELECT COUNT(*) n FROM notifications
-            WHERE farmer_id=? AND timestamp > datetime('now', ? || ' days')
-        """, (farmer["id"], f"-{days}")).fetchone()
+        # Alert count (varies by report type)
+        if report_type in ("thresholds", "threshold_alerts", "threshold-alerts"):
+            alerts_count = conn.execute("""
+                SELECT COUNT(*) n FROM notifications
+                WHERE farmer_id=?
+                  AND timestamp > datetime('now', ? || ' days')
+                  AND (
+                        message LIKE '%(CRITICAL)%'
+                     OR message LIKE '%(WARNING)%'
+                     OR subject LIKE '%Digester Alert%'
+                     OR subject='alert'
+                  )
+                  AND subject NOT LIKE '%Daily Digester Summary%'
+            """, (farmer["id"], f"-{days}")).fetchone()
+            recent_threshold_notifs = conn.execute("""
+                SELECT channel, timestamp, subject, message FROM notifications
+                WHERE farmer_id=?
+                  AND timestamp > datetime('now', ? || ' days')
+                  AND (
+                        message LIKE '%(CRITICAL)%'
+                     OR message LIKE '%(WARNING)%'
+                     OR subject LIKE '%Digester Alert%'
+                     OR subject='alert'
+                  )
+                ORDER BY id DESC
+                LIMIT 8
+            """, (farmer["id"], f"-{days}")).fetchall()
+        elif report_type in ("daily", "daily_summary", "daily-summary"):
+            alerts_count = conn.execute("""
+                SELECT COUNT(*) n FROM notifications
+                WHERE farmer_id=?
+                  AND timestamp > datetime('now', ? || ' days')
+                  AND subject LIKE '%Daily Digester Summary%'
+            """, (farmer["id"], f"-{days}")).fetchone()
+            recent_threshold_notifs = conn.execute("""
+                SELECT channel, timestamp, subject, message FROM notifications
+                WHERE farmer_id=?
+                  AND timestamp > datetime('now', ? || ' days')
+                  AND subject LIKE '%Daily Digester Summary%'
+                ORDER BY id DESC
+                LIMIT 3
+            """, (farmer["id"], f"-{days}")).fetchall()
+        else:
+            alerts_count = conn.execute("""
+                SELECT COUNT(*) n FROM notifications
+                WHERE farmer_id=? AND timestamp > datetime('now', ? || ' days')
+            """, (farmer["id"], f"-{days}")).fetchone()
+            recent_threshold_notifs = []
         # Recent predictions
         recent = conn.execute("""
             SELECT daily_biogas,weekly_biogas,money_saved,energy_kwh,
@@ -1399,7 +2293,7 @@ def generate_pdf_report():
         now = datetime.now().strftime("%d %b %Y, %I:%M %p")
         L   = []
         L.append("=" * 60)
-        L.append("        URJA NIDHI — DIGESTER REPORT")
+        L.append(f"        URJA NIDHI — {report_title}")
         L.append("=" * 60)
         L.append(f"  Farmer  : {farmer['name']}")
         L.append(f"  Email   : {farmer.get('email') or '—'}")
@@ -1436,6 +2330,24 @@ def generate_pdf_report():
         L.append("─" * 60)
         L.append(f"  Total alerts : {alerts_count['n'] if alerts_count else 0}")
         L.append("")
+        if report_type in ("thresholds", "threshold_alerts", "threshold-alerts") and recent_threshold_notifs:
+            L.append("─" * 60)
+            L.append("  RECENT THRESHOLD ALERT MESSAGES (latest 8)")
+            L.append("─" * 60)
+            for n in recent_threshold_notifs:
+                ts2 = n["timestamp"][:16].replace("T", " ")
+                msg = (n["message"] or "").replace("\n", " ").strip()
+                L.append(f"  {ts2} | {msg[:120]}")
+            L.append("")
+        elif report_type in ("daily", "daily_summary", "daily-summary") and recent_threshold_notifs:
+            L.append("─" * 60)
+            L.append("  RECENT DAILY SUMMARY NOTIFICATIONS")
+            L.append("─" * 60)
+            for n in recent_threshold_notifs:
+                ts2 = n["timestamp"][:16].replace("T", " ")
+                msg = (n["message"] or "").replace("\n", " ").strip()
+                L.append(f"  {ts2} | {msg[:120]}")
+            L.append("")
         L.append("─" * 60)
         L.append("  RECENT PREDICTIONS (last 10)")
         L.append("─" * 60)
@@ -1566,15 +2478,26 @@ def simulate_iot_feed():
             "ph":          round(_base["ph"]          + random.uniform(-0.25, 0.25), 2),
             "pressure":    round(_base["pressure"]    + random.uniform(-8, 8), 1),
             "gas_flow":    round(max(0.1, _base["gas_flow"] + random.uniform(-0.6, 0.6)), 2),
+            "methane_raw": round(random.uniform(5000, 18000), 1),
+            "methane_ppm": None,
+            "nitrogen_concentration": round(random.uniform(1500, 3000), 1),
+            "phosphorus_concentration": round(random.uniform(420, 800), 1),
+            "potassium_concentration": round(random.uniform(50, 100), 1),
             "timestamp":   datetime.now().isoformat(),
         }
+        reading["methane_ppm"] = mq5_raw_to_ppm(reading["methane_raw"])
         alerts = check_alerts(reading)
         try:
             conn = get_db()
             conn.execute("""INSERT INTO sensor_readings
-                (digester_id,temperature,ph,pressure,gas_flow,timestamp) VALUES (?,?,?,?,?,?)""",
+                (digester_id,temperature,ph,pressure,gas_flow,methane_raw,methane_ppm,
+                 nitrogen_concentration,phosphorus_concentration,potassium_concentration,timestamp)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                 (reading["digester_id"], reading["temperature"], reading["ph"],
-                 reading["pressure"], reading["gas_flow"], reading["timestamp"]))
+                 reading["pressure"], reading["gas_flow"], reading["methane_raw"],
+                 reading["methane_ppm"], reading["nitrogen_concentration"],
+                 reading["phosphorus_concentration"], reading["potassium_concentration"],
+                 reading["timestamp"]))
             conn.commit(); conn.close()
         except Exception: pass
         socketio.emit("sensor_update", {**reading, "alerts": alerts})

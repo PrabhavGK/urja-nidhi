@@ -519,7 +519,6 @@ tr:hover td { background: #f5f5ee; }
 <!-- Tabs -->
 <div class="tabs">
   <div class="tab active" onclick="showTab('dashboard')"><span class="tab-icon">🏠</span> Dashboard</div>
-  <div class="tab" onclick="showTab('predict')"><span class="tab-icon">🤖</span> AI Prediction</div>
   <div class="tab" onclick="showTab('sensors')"><span class="tab-icon">📡</span> Live Sensors</div>
   <div class="tab" onclick="showTab('advisory')"><span class="tab-icon">💬</span> Farm Advisor</div>
   <div class="tab" onclick="showTab('notify')"><span class="tab-icon">🔔</span> Notifications</div>
@@ -584,19 +583,19 @@ tr:hover td { background: #f5f5ee; }
         <div class="sensor-block ok" id="sb-temp">
           <div class="label">Temperature</div>
           <div class="value" id="sv-temp">—</div>
-          <div style="font-size:11px;color:var(--text3)">Ideal: 35–40°C</div>
+          <div style="font-size:11px;color:var(--text3)">Ideal: 20–30°C</div>
           <div class="bar-wrap"><div class="bar" id="bar-temp" style="width:50%;background:var(--sun)"></div></div>
         </div>
         <div class="sensor-block ok" id="sb-ph">
           <div class="label">pH Level</div>
           <div class="value" id="sv-ph">—</div>
-          <div style="font-size:11px;color:var(--text3)">Ideal: 6.8–7.2</div>
+          <div style="font-size:11px;color:var(--text3)">Ideal: 6.0–8.5</div>
           <div class="bar-wrap"><div class="bar" id="bar-ph" style="width:60%;background:var(--leaf)"></div></div>
         </div>
         <div class="sensor-block ok" id="sb-pres">
           <div class="label">Pressure</div>
           <div class="value" id="sv-pres">—</div>
-          <div style="font-size:11px;color:var(--text3)">kPa</div>
+          <div style="font-size:11px;color:var(--text3)">Normal: 80–130 kPa</div>
           <div class="bar-wrap"><div class="bar" id="bar-pres" style="width:70%;background:var(--sky)"></div></div>
         </div>
         <div class="sensor-block ok" id="sb-flow">
@@ -605,8 +604,16 @@ tr:hover td { background: #f5f5ee; }
           <div style="font-size:11px;color:var(--text3)">L / hour</div>
           <div class="bar-wrap"><div class="bar" id="bar-flow" style="width:40%;background:var(--earth)"></div></div>
         </div>
+        <div class="sensor-block ok" id="sb-meth">
+          <div class="label">🔥 Methane (MQ5)</div>
+          <div class="value" id="sv-meth">— ppm</div>
+        <div style="font-size:11px;color:var(--text3)">OK: 1000–3000 ppm</div>
+          <div class="bar-wrap"><div class="bar" id="bar-meth" style="width:0%;background:var(--sun)"></div></div>
+        </div>
       </div>
     </div>
+
+    <div id="ai-prediction-placeholder" style="grid-column: 1 / -1;"></div>
 
     <!-- 7-day chart -->
     <div class="section">
@@ -617,8 +624,8 @@ tr:hover td { background: #f5f5ee; }
 
   <!-- NPK quick view -->
   <div class="section">
-    <div class="section-title"><span>🌾</span> Manure Nutrient Status (Last Prediction)</div>
-    <div id="npk-empty" class="empty-state"><div class="es-icon">🌾</div>Run an AI Prediction to see your manure's nutrient profile</div>
+    <div class="section-title"><span>🌾</span> Manure Nutrient Status (Live NPK)</div>
+    <div id="npk-empty" class="empty-state"><div class="es-icon">🌾</div>Waiting for live NPK values from your sensors…</div>
     <div id="npk-box" style="display:none">
       <div class="npk-row">
         <div class="npk-labels"><span class="npk-name">Nitrogen (N)</span><span id="npk-n-v" style="color:var(--leaf);font-weight:600">—</span></div>
@@ -767,19 +774,19 @@ tr:hover td { background: #f5f5ee; }
       <div class="sensor-block ok" id="big-temp">
         <div class="label">🌡️ Temperature</div>
         <div class="value" id="bsv-temp">— °C</div>
-        <div style="font-size:12px;color:var(--text3);margin-top:4px">Optimal: 35–40°C</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Ideal: 20–30°C</div>
         <div class="bar-wrap"><div class="bar" id="bbar-temp" style="width:50%;background:var(--sun)"></div></div>
       </div>
       <div class="sensor-block ok" id="big-ph">
         <div class="label">⚗️ pH Level</div>
         <div class="value" id="bsv-ph">—</div>
-        <div style="font-size:12px;color:var(--text3);margin-top:4px">Optimal: 6.8–7.2</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Ideal: 6.0–8.5</div>
         <div class="bar-wrap"><div class="bar" id="bbar-ph" style="width:60%;background:var(--leaf)"></div></div>
       </div>
       <div class="sensor-block ok" id="big-pres">
         <div class="label">🔵 Pressure (kPa)</div>
         <div class="value" id="bsv-pres">— kPa</div>
-        <div style="font-size:12px;color:var(--text3);margin-top:4px">Normal: 95–115 kPa</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Normal: 80–130 kPa</div>
         <div class="bar-wrap"><div class="bar" id="bbar-pres" style="width:70%;background:var(--sky)"></div></div>
       </div>
       <div class="sensor-block ok" id="big-flow">
@@ -787,6 +794,34 @@ tr:hover td { background: #f5f5ee; }
         <div class="value" id="bsv-flow">— L/h</div>
         <div style="font-size:12px;color:var(--text3);margin-top:4px">Good: > 2 L/h</div>
         <div class="bar-wrap"><div class="bar" id="bbar-flow" style="width:40%;background:var(--earth)"></div></div>
+      </div>
+
+      <div class="sensor-block ok" id="big-meth">
+        <div class="label">🔥 Methane (MQ5)*14.5</div>
+        <div class="value" id="bsv-meth">— ppm</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">OK: 1000–3000 ppm</div>
+        <div class="bar-wrap"><div class="bar" id="bbar-meth" style="width:0%;background:var(--sun)"></div></div>
+      </div>
+
+      <div class="sensor-block ok" id="big-n">
+        <div class="label">🌿 Nitrogen (N)</div>
+        <div class="value" id="bsv-n">— mg/kg</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Optimal: 1500–3000</div>
+        <div class="bar-wrap"><div class="bar" id="bbar-n" style="width:0%;background:var(--leaf)"></div></div>
+      </div>
+
+      <div class="sensor-block ok" id="big-p">
+        <div class="label">🧂 Phosphorus (P)</div>
+        <div class="value" id="bsv-p">— mg/kg</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Optimal: 420–800</div>
+        <div class="bar-wrap"><div class="bar" id="bbar-p" style="width:0%;background:var(--sky)"></div></div>
+      </div>
+
+      <div class="sensor-block ok" id="big-k">
+        <div class="label">🍃 Potassium (K)</div>
+        <div class="value" id="bsv-k">— mg/kg</div>
+        <div style="font-size:12px;color:var(--text3);margin-top:4px">Optimal: 50–150</div>
+        <div class="bar-wrap"><div class="bar" id="bbar-k" style="width:0%;background:var(--sun)"></div></div>
       </div>
     </div>
     <div class="section-title" style="margin-top:6px"><span>📈</span> Full Sensor Trend (Temp, pH, Pressure, Gas Flow)</div>
@@ -955,6 +990,19 @@ tr:hover td { background: #f5f5ee; }
         <div class="empty-state"><div class="es-icon">📭</div>No alerts sent to your account yet</div>
       </div>
       <button class="btn btn-outline btn-sm" style="margin-top:12px" onclick="loadMyAlerts()">🔄 Refresh</button>
+
+      <!-- Report downloads for push notifications -->
+      <div style="margin-top:16px;padding:12px 14px;border:1px solid var(--border);border-radius:10px;background:var(--white)">
+        <div style="font-size:13px;font-weight:700;color:var(--text);margin-bottom:10px">📥 Download Reports</div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button class="btn btn-primary btn-sm" onclick="downloadNotificationReport('weekly')">Weekly</button>
+          <button class="btn btn-primary btn-sm" onclick="downloadNotificationReport('monthly')">Monthly</button>
+          <button class="btn btn-outline btn-sm" onclick="downloadNotificationReport('daily_summary')">Daily Summary</button>
+          <button class="btn btn-outline btn-sm" onclick="downloadNotificationReport('prediction_alerts')">Prediction</button>
+          <button class="btn btn-outline btn-sm" onclick="downloadNotificationReport('threshold_alerts')">Threshold Alerts</button>
+        </div>
+        <div id="notify-report-status" style="margin-top:10px;font-size:13px;color:var(--text3)"></div>
+      </div>
     </div>
 
     <!-- What triggers alerts -->
@@ -1251,7 +1299,7 @@ function showTab(name) {
   if (name === 'history')  loadHistory();
   if (name === 'notify')   { updateAuthUI(); if (SESSION_TOKEN) { loadMyAlerts(); loadThresholds(); } }
   if (name === 'advisory') loadAdvisoryHistory();
-  if (name === 'predict')  { loadPredictLatest(); loadUserCrops(); }
+  if (name === 'dashboard') { loadPredictLatest(); if (SESSION_TOKEN) loadUserCrops(); }
   if (name === 'sensors')  loadSensorHistoryForTrend();
 }
 
@@ -1383,8 +1431,62 @@ const now = () => new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'
 const nowShort = () => new Date().toLocaleTimeString('en-IN',{hour:'2-digit',minute:'2-digit'});
 const set = (id,v) => { const e=document.getElementById(id); if(e) e.textContent=v; };
 
+function updateNpkDisplayFromSensor(d) {
+  const n = (d && (d.nitrogen_concentration ?? d.nitrogen_mgkg)) ?? null;
+  const p = (d && (d.phosphorus_concentration ?? d.phosphorus_mgkg)) ?? null;
+  const k = (d && (d.potassium_concentration ?? d.potassium_mgkg)) ?? null;
+
+  const emptyEl = document.getElementById('npk-empty');
+  const boxEl   = document.getElementById('npk-box');
+  if (!emptyEl || !boxEl) return;
+
+  const nOk = n !== null && !Number.isNaN(Number(n));
+  const pOk = p !== null && !Number.isNaN(Number(p));
+  const kOk = k !== null && !Number.isNaN(Number(k));
+
+  if (!nOk && !pOk && !kOk) {
+    emptyEl.style.display = 'block';
+    boxEl.style.display   = 'none';
+    return;
+  }
+
+  emptyEl.style.display = 'none';
+  boxEl.style.display   = 'block';
+
+  const nf = nOk ? Number(n) : 0;
+  const pf = pOk ? Number(p) : 0;
+  const kf = kOk ? Number(k) : 0;
+  const mx = Math.max(nf, pf, kf, 1);
+
+  set('npk-n-v', nf + ' mg/kg'); document.getElementById('npk-n-b').style.width = (nf / mx) * 100 + '%';
+  set('npk-p-v', pf + ' mg/kg'); document.getElementById('npk-p-b').style.width = (pf / mx) * 100 + '%';
+  set('npk-k-v', kf + ' mg/kg'); document.getElementById('npk-k-b').style.width = (kf / mx) * 100 + '%';
+}
+
 function updateSensors(d) {
   const t=d.temperature, ph=d.ph, pr=d.pressure, fl=d.gas_flow;
+  // Methane UI must be ppm-only. If `methane_ppm` is missing, we derive ppm from `methane_raw`,
+  // but we never display or label raw values in the UI.
+  const mq5RawToPpm = (raw) => {
+    const r = Number(raw);
+    if (r == null || Number.isNaN(r) || r < 0) return null;
+    // Piecewise-linear mapping aligned with MQ5 raw bands:
+    // 0-3000   -> 0-200 ppm
+    // 3000-8000 -> 200-1000 ppm
+    // 8000-16000 -> 1000-3000 ppm
+    // 16000-24000 -> 3000-6000 ppm
+    if (r <= 3000) return (r / 3000) * 200;
+    if (r <= 8000) return 200 + (r - 3000) * (800 / 5000);
+    if (r <= 16000) return 1000 + (r - 8000) * (2000 / 8000);
+    if (r <= 24000) return 3000 + (r - 16000) * (3000 / 8000);
+    return 6000 + (r - 24000) * (3000 / 8000);
+  };
+
+  // Always recompute ppm from raw band mapping for consistent ppm-only UI.
+  const methPpm = (d.methane_raw != null) ? mq5RawToPpm(d.methane_raw) : (d.methane_ppm ?? null);
+  const n=(d.nitrogen_concentration ?? d.nitrogen_mgkg ?? null);
+  const p=(d.phosphorus_concentration ?? d.phosphorus_mgkg ?? null);
+  const k=(d.potassium_concentration ?? d.potassium_mgkg ?? null);
 
   // Dashboard mini sensors
   set('sv-temp', t  !=null ? t.toFixed(1)+'°C'   : '—');
@@ -1392,39 +1494,95 @@ function updateSensors(d) {
   set('sv-pres', pr !=null ? pr.toFixed(1)+' kPa' : '—');
   set('sv-flow', fl !=null ? fl.toFixed(2)+' L/h' : '—');
 
+  // Nutrients mini display
+  if(document.getElementById('sv-meth')) set('sv-meth', methPpm!=null ? Number(methPpm).toFixed(0)+' ppm' : '—');
+  if(document.getElementById('sv-n'))    set('sv-n',    n!=null ? Number(n).toFixed(0)+' mg/kg' : '—');
+  if(document.getElementById('sv-p'))    set('sv-p',    p!=null ? Number(p).toFixed(0)+' mg/kg' : '—');
+  if(document.getElementById('sv-k'))    set('sv-k',    k!=null ? Number(k).toFixed(0)+' mg/kg' : '—');
+
   // Sensors tab big readings
   set('bsv-temp', t  !=null ? t.toFixed(1)+'°C'   : '—');
   set('bsv-ph',   ph !=null ? ph.toFixed(2)        : '—');
   set('bsv-pres', pr !=null ? pr.toFixed(1)+' kPa' : '—');
   set('bsv-flow', fl !=null ? fl.toFixed(2)+' L/h' : '—');
 
+  // Nutrient big readings
+  if(document.getElementById('bsv-meth')) set('bsv-meth', methPpm!=null ? Number(methPpm).toFixed(0)+' ppm' : '—');
+  if(document.getElementById('bsv-n'))    set('bsv-n',    n!=null ? Number(n).toFixed(0)+' mg/kg' : '—');
+  if(document.getElementById('bsv-p'))    set('bsv-p',    p!=null ? Number(p).toFixed(0)+' mg/kg' : '—');
+  if(document.getElementById('bsv-k'))    set('bsv-k',    k!=null ? Number(k).toFixed(0)+' mg/kg' : '—');
+
   // Bars
   const tp = t  ? Math.min(100,Math.max(0,(t-20)/30*100))   : 0;
   const pp = ph ? Math.min(100,Math.max(0,(ph-5)/4*100))    : 0;
   const prp= pr ? Math.min(100,Math.max(0,(pr-50)/150*100)) : 0;
   const fp = fl ? Math.min(100,fl/10*100)                   : 0;
+  // Bar scale: 0–6000 ppm mapped to 0–100%.
+  const methp = methPpm != null ? Math.min(100, Math.max(0, Number(methPpm) / 6000 * 100)) : 0;
+  const np = n!=null ? Math.min(100, Math.max(0, (Number(n)-1000)/2500*100)) : 0;
+  const pConcBar = p!=null ? Math.min(100, Math.max(0, (Number(p)-200)/800*100)) : 0;
+  const kp = k!=null ? Math.min(100, Math.max(0, (Number(k)-50)/1500*100)) : 0;
 
   ['bar-temp','bbar-temp'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=tp+'%'; });
   ['bar-ph','bbar-ph'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=pp+'%'; });
   ['bar-pres','bbar-pres'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=prp+'%'; });
   ['bar-flow','bbar-flow'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=fp+'%'; });
+  ['bar-meth','bbar-meth'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=methp+'%'; });
+  ['bar-n','bbar-n'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=np+'%'; });
+  ['bar-p','bbar-p'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=pConcBar+'%'; });
+  ['bar-k','bbar-k'].forEach(id=>{ const e=document.getElementById(id); if(e) e.style.width=kp+'%'; });
 
   // pH status colour
-  const phOk = ph >= 6.5 && ph <= 7.8;
+  const phCrit = (ph != null && (ph < 4.0 || ph > 10.0));
+  const phWarn = (ph != null && ((ph >= 4.0 && ph < 6.0) || (ph > 8.5 && ph <= 10.0)));
+  const phOk = ph != null && (!phCrit && !phWarn);
   ['sb-ph','big-ph'].forEach(id=>{
     const e=document.getElementById(id);
-    if(e){ e.className='sensor-block '+(phOk?'ok':(ph<6.5?'crit':'warn')); }
+    if(e){ e.className='sensor-block '+(phOk?'ok':(phCrit?'crit':'warn')); }
   });
   ['bar-ph','bbar-ph'].forEach(id=>{
     const e=document.getElementById(id);
-    if(e) e.style.background = phOk?'var(--leaf)':(ph<6.5?'var(--red)':'var(--amber)');
+    if(e) e.style.background = phOk?'var(--leaf)':(phCrit?'var(--red)':'var(--amber)');
   });
 
   // Temp colour
-  const tempOk = t>=30 && t<=42;
+  const tempCrit = (t != null && (t < 10 || t > 40));
+  const tempWarn = (t != null && ((t >= 10 && t < 20) || (t > 30 && t <= 40)));
+  const tempOk = t != null && (!tempCrit && !tempWarn);
   ['sb-temp','big-temp'].forEach(id=>{
     const e=document.getElementById(id);
-    if(e) e.className='sensor-block '+(tempOk?'ok':(t<30?'warn':'crit'));
+    if(e) e.className='sensor-block '+(tempOk?'ok':(tempCrit?'crit':'warn'));
+  });
+
+  // Methane colour (ppm-only thresholds aligned to your MQ5 raw bands):
+  // crit: <200 ppm or >6000 ppm
+  // warn: 200–1000 ppm OR 3000–6000 ppm
+  // ok  : 1000–3000 ppm
+  const methCrit = (methPpm != null && (Number(methPpm) < 200 || Number(methPpm) > 6000));
+  const methOk   = (methPpm != null && Number(methPpm) >= 1000 && Number(methPpm) <= 3000);
+  const methWarn = (methPpm != null && !methCrit && !methOk);
+  ['sb-meth','big-meth'].forEach(id=>{
+    const e=document.getElementById(id);
+    if(e){
+      e.className='sensor-block '+(methOk?'ok':(methCrit?'crit':'warn'));
+    }
+  });
+
+  // Pressure classification (kPa)
+  // ok: 80-130, warn: 50-80 or 130-150, crit: <50 or >150
+  const prCrit = (pr != null && (pr < 50 || pr > 150));
+  const prWarn = (pr != null && ((pr >= 50 && pr < 80) || (pr > 130 && pr <= 150)));
+  const prOk = pr != null && (!prCrit && !prWarn);
+  ['sb-pres','big-pres'].forEach(id=>{
+    const e=document.getElementById(id);
+    if(e){ e.className='sensor-block '+(prOk?'ok':(prCrit?'crit':'warn')); }
+  });
+
+  // Nitrogen colour (1500-3000 = ok)
+  const nOk = n!=null ? (Number(n) >= 1500 && Number(n) <= 3000) : true;
+  ['sb-n','big-n'].forEach(id=>{
+    const e=document.getElementById(id);
+    if(e){ e.className='sensor-block '+(nOk?'ok':(n<1500?'warn':'crit')); }
   });
 
   // Trend chart
@@ -1437,6 +1595,9 @@ function updateSensors(d) {
 
   set('ts-badge', 'Last update: ' + ts);
   document.getElementById('ws-dot').className = 'dot on';
+
+  // Keep dashboard NPK quick-view synchronized with live sensor stream.
+  updateNpkDisplayFromSensor(d);
 }
 
 function showAlerts(alerts) {
@@ -1491,19 +1652,6 @@ function applyPrediction(r) {
     ab.innerHTML='⚠️ '+r.alerts.map(al=>al.message).join(' | ');
   } else { ab.style.display='none'; }
 
-  // NPK (from form if present, else defaults)
-  const fnc=document.getElementById('f-nc');
-  const fpc=document.getElementById('f-pc');
-  const fkc=document.getElementById('f-kc');
-  const nc=fnc?parseFloat(fnc.value)||2000:2000;
-  const pc=fpc?parseFloat(fpc.value)||500:500;
-  const kc=fkc?parseFloat(fkc.value)||1200:1200;
-  const mx2=Math.max(nc,pc,kc,1);
-  document.getElementById('npk-empty').style.display='none';
-  document.getElementById('npk-box').style.display='block';
-  set('npk-n-v', nc+' mg/kg'); document.getElementById('npk-n-b').style.width=nc/mx2*100+'%';
-  set('npk-p-v', pc+' mg/kg'); document.getElementById('npk-p-b').style.width=pc/mx2*100+'%';
-  set('npk-k-v', kc+' mg/kg'); document.getElementById('npk-k-b').style.width=kc/mx2*100+'%';
   set('npk-score', r.compost_score||'—');
 
   addHistRow(r);
@@ -2051,6 +2199,32 @@ async function downloadReport() {
   }
   btn.disabled = false; btn.textContent = '📥 Download Report';
 }
+
+async function downloadNotificationReport(type) {
+  if (!SESSION_TOKEN) { openAuthModal(); return; }
+  const st = document.getElementById('notify-report-status');
+  if (st) { st.textContent = '⏳ Generating…'; st.style.color = 'var(--text3)'; }
+  try {
+    const res = await fetch(`/api/report/pdf?type=${encodeURIComponent(type)}`, { headers: authHeaders() });
+    if (!res.ok) {
+      const d = await res.json();
+      if (st) { st.textContent = '❌ ' + (d.error || 'Failed'); st.style.color = 'var(--red)'; }
+      return;
+    }
+    const blob     = await res.blob();
+    const url      = URL.createObjectURL(blob);
+    const filename = res.headers.get('Content-Disposition')?.match(/filename=(.+)/)?.[1]
+                     || `urja_nidhi_${type}_report.txt`;
+    const a        = document.createElement('a');
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click();
+    document.body.removeChild(a); URL.revokeObjectURL(url);
+    if (st) { st.textContent = '✅ Report downloaded!'; st.style.color = 'var(--leaf)'; }
+    setTimeout(() => { if (st) st.textContent = ''; }, 4000);
+  } catch(e) {
+    if (st) { st.textContent = '❌ Error: ' + e.message; st.style.color = 'var(--red)'; }
+  }
+}
 const socket=io(window.location.origin,{transports:['websocket','polling']});
 socket.on('connect',()=>{
   document.getElementById('ws-dot').className='dot on';
@@ -2067,10 +2241,36 @@ socket.on('sensor_update',d=>{
 socket.on('prediction_update',d=>applyPrediction(d));
 socket.on('advisory_response',d=>{/* handled in sendChat */});
 
+function mergePredictionIntoDashboard() {
+  const placeholder = document.getElementById('ai-prediction-placeholder');
+  const predPage = document.getElementById('tab-predict');
+  if (!placeholder || !predPage) return;
+  if (placeholder.dataset.merged === '1') return;
+
+  while (predPage.firstChild) placeholder.appendChild(predPage.firstChild);
+  placeholder.dataset.merged = '1';
+  predPage.style.display = 'none';
+}
+
+async function loadLatestSensorSnapshot() {
+  try {
+    // Fetch the latest row from SQLite (fed by Firebase listener / /api/sensor ingestion).
+    const res  = await fetch('/api/sensors/history?limit=1');
+    const rows = await res.json();
+    if (rows && rows.length) {
+      updateSensors(rows[rows.length - 1]);
+    }
+  } catch(e) {}
+}
+
+mergePredictionIntoDashboard();
+
 // ── Init ─────────────────────────────────────────────────
 restoreSession().then(() => {
   if (SESSION_TOKEN) { loadThresholds(); loadUserCrops(); }
+  loadLatestSensorSnapshot();
   loadDashboardData();
+  loadPredictLatest();
   const dt = document.getElementById('cc-start-date');
   if (dt && !dt.value) dt.value = new Date().toISOString().slice(0,10);
 });
